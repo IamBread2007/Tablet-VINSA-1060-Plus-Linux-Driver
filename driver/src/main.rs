@@ -4,6 +4,7 @@ mod physical_device;
 
 use std::u16;
 use std::fmt::Display;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -91,6 +92,18 @@ fn translated_format(message: &str, value: impl Display) -> String {
     gettext(message).replacen("{}", &value.to_string(), 1)
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 
 // Función auxiliar para parsear e incrustar el SVG en la barra de tareas
 fn crear_icono_desde_svg_bytes(bytes: &[u8], tamano: u32) -> Result<Icon, String> {
@@ -169,13 +182,39 @@ fn main() {
     let dispatcher = Arc::new(Mutex::new(DeviceDispatcher::new()));
     let dispatcher_clone = Arc::clone(&dispatcher);
 
+    // Optional raw HID report logger for diagnostics/tuning.
+    // Usage: VINSA_RAW_LOG=/tmp/vinsa-raw.log ./v1060p
+    let mut raw_log = std::env::var_os("VINSA_RAW_LOG").and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    if raw_log.is_some() {
+        println!("Raw HID report logging enabled (VINSA_RAW_LOG)");
+    }
+
     // 2. HILO SECUNDARIO: Lector USB en segundo plano
     thread::spawn(move || {
         let mut data_reader = RawDataReader::new();
         loop {
             let mut read_at_least_one = false;
 
-            while let Ok(_) = physical_device.read_device_responses(&mut data_reader.data) {
+            while let Ok(read_len) = physical_device.read_device_responses(&mut data_reader.data) {
+                if let Some(file) = raw_log.as_mut() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        file,
+                        "{}.{:06} {} {}",
+                        now.as_secs(),
+                        now.subsec_micros(),
+                        read_len,
+                        hex_bytes(&data_reader.data[..read_len.min(data_reader.data.len())])
+                    );
+                }
                 if let Ok(mut disp) = dispatcher_clone.lock() {
                     disp.dispatch(&data_reader);
                 }
@@ -221,11 +260,13 @@ fn main() {
     let dispatcher_ui = Arc::clone(&dispatcher);
     let mut last_known_mode = true; // true = Ratón, false = Tableta
 
-    event_loop.set_control_flow(ControlFlow::WaitUntil(
-        std::time::Instant::now() + std::time::Duration::from_millis(100)
-    ));
-
     event_loop.run(move |_event, event_loop| {
+        // Renovar el plazo en cada iteración: si no, WaitUntil queda en el pasado
+        // y el bucle gira sin dormir consumiendo una CPU entera.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(100)
+        ));
+
         // Ejecutar iteración del bucle principal de GTK para procesar eventos
         gtk::main_iteration_do(false);
 

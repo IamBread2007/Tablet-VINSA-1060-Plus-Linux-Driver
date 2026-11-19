@@ -69,7 +69,7 @@ pub struct DeviceDispatcher {
     tablet_last_raw_pressed_buttons: u16,
     pen_last_raw_pressed_button: u8,
     tablet_button_id_to_key_code_map: HashMap<u8, Vec<Key>>,
-    _pen_button_id_to_key_code_map: HashMap<u8, Vec<Key>>,
+    pen_button_id_to_key_code_map: HashMap<u8, Vec<Key>>,
 
     // Tres dispositivos independientes para no confundir a Libinput/Wayland
     virtual_pen: VirtualDevice,
@@ -82,6 +82,21 @@ pub struct DeviceDispatcher {
     last_y: i32,
     last_valid_x: i32,
     mouse_area_scale: f32,
+
+    // Presion medida sobre hardware real (ver constantes RAW_PRESSURE_*)
+    pen_touching: bool,
+    smoothed_pressure: f32,
+    pressure_span: i32,
+    pressure_curve: f32,
+    pressure_smoothing: f32,
+    // Acumuladores sub-pixel para el raton relativo
+    mouse_accum_x: f32,
+    mouse_accum_y: f32,
+    // Filtro paso-bajo de la posicion en modo raton (0 = sin filtro, 0.95 = muy suave)
+    mouse_filter_x: f32,
+    mouse_filter_y: f32,
+    mouse_have_ref: bool,
+    mouse_smoothing: f32,
 
     // Historial para control estricto de duplicados USB
     last_raw_usb_x: i32,
@@ -100,6 +115,33 @@ impl DeviceDispatcher {
     const PRESSED: i32 = 1;
     const RELEASED: i32 = 0;
     const HOLD: i32 = 2;
+
+    // --- Calibración de presión medida sobre la tableta real ---
+    // El firmware entrega un valor que DECRECE al apretar:
+    //   ~1600 -> lápiz fuera del alcance
+    //   ~1500 -> flotando justo sobre la superficie
+    //   <=1450 -> contacto
+    //   ~650  -> fuerza máxima
+    // Con el mapeo antiguo (1300 - raw) todo lo que estuviera por encima de
+    // 1300 se descartaba: se perdía ~30% del recorrido y los trazos suaves.
+    const RAW_PRESSURE_TOUCH_ON: i32 = 1450;
+    const RAW_PRESSURE_TOUCH_OFF: i32 = 1500;
+    const RAW_PRESSURE_DEFAULT_SPAN: i32 = 800; // 1450 - 650
+
+    fn env_f32(name: &str, default: f32) -> f32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+    }
+
+    fn env_i32(name: &str, default: i32) -> i32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(default)
+    }
 
     pub fn new() -> Self {
         let default_tablet_button_id_to_key_code_map: HashMap<u8, Vec<Key>> = [
@@ -164,7 +206,7 @@ impl DeviceDispatcher {
             tablet_last_raw_pressed_buttons: 0xFFFF,
             pen_last_raw_pressed_button: 0,
             tablet_button_id_to_key_code_map: default_tablet_button_id_to_key_code_map.clone(),
-            _pen_button_id_to_key_code_map: default_pen_button_id_to_key_code_map.clone(),
+            pen_button_id_to_key_code_map: default_pen_button_id_to_key_code_map.clone(),
 
             virtual_keyboard: Self::virtual_keyboard_builder(&all_keyboard_keys).expect("Error virtual_keyboard"),
             virtual_mouse: Self::virtual_mouse_builder().expect("Error virtual_mouse"),
@@ -176,6 +218,18 @@ impl DeviceDispatcher {
             last_y: 2048,
 
             mouse_area_scale: 0.10, // Valor de sensibilidad de inicio
+
+            pen_touching: false,
+            smoothed_pressure: 0.0,
+            pressure_span: Self::env_i32("VINSA_PRESSURE_SPAN", Self::RAW_PRESSURE_DEFAULT_SPAN),
+            pressure_curve: Self::env_f32("VINSA_PRESSURE_CURVE", 1.0),
+            pressure_smoothing: Self::env_f32("VINSA_PRESSURE_SMOOTHING", 0.35),
+            mouse_accum_x: 0.0,
+            mouse_accum_y: 0.0,
+            mouse_filter_x: 0.0,
+            mouse_filter_y: 0.0,
+            mouse_have_ref: false,
+            mouse_smoothing: Self::env_f32("VINSA_MOUSE_SMOOTH", 0.5),
 
             last_valid_x: 2048,
             last_raw_usb_x: -1,
@@ -368,9 +422,20 @@ impl DeviceDispatcher {
         .build()
     }
 
-    fn normalize_pressure_mode(raw_pressure: i32, threshold: i32, scaling: i32) -> i32 {
-        let inverted_pressure = 1300 - raw_pressure;
-        if inverted_pressure <= threshold { 0 } else { ((inverted_pressure - threshold) * scaling).clamp(0, 8191) }
+    /// Convierte la presión cruda del firmware (decrece al apretar) a 0..8191.
+    fn normalize_pressure(&self, raw_pressure: i32) -> i32 {
+        let over = Self::RAW_PRESSURE_TOUCH_ON - raw_pressure;
+        if over <= 0 {
+            return 0;
+        }
+        let span = self.pressure_span.max(1);
+        let linear = (over as f32 / span as f32).clamp(0.0, 1.0);
+        let shaped = if (self.pressure_curve - 1.0).abs() < f32::EPSILON {
+            linear
+        } else {
+            linear.powf(self.pressure_curve)
+        };
+        (shaped * 8191.0).round() as i32
     }
 
 
@@ -378,22 +443,39 @@ impl DeviceDispatcher {
         let y_raw = raw_data.y_axis();
         let is_multimedia_area = y_raw >= 61000;
 
+        // --- FUERA DE ALCANCE ---
+        // El firmware entrega Y=0 cuando el lapiz sale del area activa. Si no se
+        // filtra, en modo raton el cursor salta al borde de la pantalla.
+        if y_raw == 0 && raw_data.pressure() >= Self::RAW_PRESSURE_TOUCH_OFF {
+            if self.was_touching {
+                self.pen_emit_touch(0, false);
+            }
+            self.pen_touching = false;
+            self.smoothed_pressure = 0.0;
+            self.invalidate_mouse_reference();
+            return;
+        }
+
         // --- INTERCEPCIÓN TOTAL DEL ÁREA MULTIMEDIA ---
         if is_multimedia_area {
             // Forzamos la liberación inmediata del touch/click por si veníamos arrastrando el lápiz desde abajo
             if self.was_touching {
-                self.pen_emit_touch(0);
+                self.pen_emit_touch(0, false);
             }
 
             // Procesamos la pulsación del botón multimedia basado en la presión invertida (< 1200)
             self.process_multimedia_area(raw_data.x_axis(), raw_data.pressure());
+
+            // Al salir del area, la referencia del raton se descarta para no
+            // arrastrar un salto enorme al volver al area de dibujo.
+            self.invalidate_mouse_reference();
 
             // Con return, evitamos por completo enviar coordenadas absolutas o eventos de click
             return;
         } else {
             // Si salimos de la zona multimedia, nos aseguramos de liberar cualquier botón enganchado
             if self.active_multimedia_key.is_some() {
-                self.process_multimedia_area(raw_data.x_axis(), 1300); // 1300 = Aire (libera)
+                self.process_multimedia_area(raw_data.x_axis(), Self::RAW_PRESSURE_TOUCH_OFF);
             }
             self.last_valid_x = raw_data.x_axis();
         }
@@ -405,24 +487,66 @@ impl DeviceDispatcher {
             self.pen_last_raw_pressed_button = raw_pen_buttons;
         }
 
-        let normalized_pressure = if self.is_mouse_mode {
-            Self::normalize_pressure_mode(raw_data.pressure(), 300, 10)
+        // Detección de contacto con histéresis: cerca del umbral el ruido del
+        // sensor (~±20 cuentas) cortaba y reanudaba el trazo constantemente.
+        let raw_pressure = raw_data.pressure();
+        let touching = if self.pen_touching {
+            raw_pressure < Self::RAW_PRESSURE_TOUCH_OFF
         } else {
-            Self::normalize_pressure_mode(raw_data.pressure(), 20, 12)
+            raw_pressure < Self::RAW_PRESSURE_TOUCH_ON
+        };
+        self.pen_touching = touching;
+
+        let target_pressure = if touching { self.normalize_pressure(raw_pressure) } else { 0 };
+        // Suavizado exponencial corto (~10 ms a la frecuencia real del lápiz).
+        self.smoothed_pressure = self.smoothed_pressure * self.pressure_smoothing
+            + target_pressure as f32 * (1.0 - self.pressure_smoothing);
+        let normalized_pressure = if touching {
+            self.smoothed_pressure.round() as i32
+        } else {
+            self.smoothed_pressure = 0.0;
+            0
         };
 
         // Aquí es donde se mueven y hacen click los dispositivos virtuales de evdev
         self.raw_pen_abs_to_pen_abs_events(raw_data.x_axis(), raw_data.y_axis(), normalized_pressure, is_multimedia_area);
-        self.pen_emit_touch(normalized_pressure);
+        self.pen_emit_touch(normalized_pressure, touching);
+    }
+
+    fn invalidate_mouse_reference(&mut self) {
+        self.mouse_have_ref = false;
+        self.mouse_accum_x = 0.0;
+        self.mouse_accum_y = 0.0;
     }
 
     fn raw_pen_abs_to_pen_abs_events(&mut self, x_axis: i32, y_axis: i32, pressure: i32, is_multimedia_area: bool) {
         if self.is_mouse_mode {
-            // --- MODO RATÓN RELATIVO DINÁMICO ---
-            if self.last_x != 2048 && !is_multimedia_area {
+            // --- MODO RATÓN RELATIVO ---
+            if !self.mouse_have_ref {
+                // Primera muestra válida: solo fijamos la referencia.
+                self.mouse_filter_x = x_axis as f32;
+                self.mouse_filter_y = y_axis as f32;
+                self.mouse_have_ref = true;
+                self.mouse_accum_x = 0.0;
+                self.mouse_accum_y = 0.0;
+            } else {
+                // Filtro exponencial corto: quita el temblor del sensor (~±2
+                // cuentas) sin latencia perceptible; el acumulador sub-pixel
+                // evita que los deltas menores a 1 píxel se pierdan.
+                let alpha = self.mouse_smoothing.clamp(0.0, 0.95);
+                let prev_x = self.mouse_filter_x;
+                let prev_y = self.mouse_filter_y;
+                self.mouse_filter_x = prev_x * alpha + x_axis as f32 * (1.0 - alpha);
+                self.mouse_filter_y = prev_y * alpha + y_axis as f32 * (1.0 - alpha);
 
-                let rel_x = ((x_axis - self.last_x) as f32 * self.mouse_area_scale * 12.0).round() as i32;
-                let rel_y = ((y_axis - self.last_y) as f32 * self.mouse_area_scale * 12.0).round() as i32;
+                let factor = self.mouse_area_scale * 12.0;
+                self.mouse_accum_x += (self.mouse_filter_x - prev_x) * factor;
+                self.mouse_accum_y += (self.mouse_filter_y - prev_y) * factor;
+
+                let rel_x = self.mouse_accum_x.trunc() as i32;
+                let rel_y = self.mouse_accum_y.trunc() as i32;
+                self.mouse_accum_x -= rel_x as f32;
+                self.mouse_accum_y -= rel_y as f32;
 
                 if rel_x != 0 || rel_y != 0 {
                     let _ = self.virtual_mouse.emit(&[
@@ -483,8 +607,7 @@ impl DeviceDispatcher {
         }
     }
 
-    fn pen_emit_touch(&mut self, pressure: i32) {
-        let is_touching = pressure > 0;
+    fn pen_emit_touch(&mut self, _pressure: i32, is_touching: bool) {
 
         if !self.is_mouse_mode {
             // --- CORRECCIÓN PARA EL MODO TABLETA EN WAYLAND ---
@@ -526,7 +649,7 @@ impl DeviceDispatcher {
                 let target_click = if id == 6 { Key::BTN_RIGHT } else { Key::BTN_MIDDLE };
                 let _ = self.virtual_mouse.emit(&[InputEvent::new(EventType::KEY, target_click.code(), state)]);
             } else {
-                if let Some(keys) = self.tablet_button_id_to_key_code_map.get(&id) {
+                if let Some(keys) = self.pen_button_id_to_key_code_map.get(&id) {
                     for key in keys {
                         let _ = self.virtual_pen.emit(&[InputEvent::new(EventType::KEY, key.code(), state)]);
                     }
@@ -553,7 +676,7 @@ impl DeviceDispatcher {
 
     fn process_multimedia_area(&mut self, x: i32, pressure: i32) {
 
-        let is_touching = pressure < 1200;
+        let is_touching = pressure < Self::RAW_PRESSURE_TOUCH_ON;
 
         if is_touching {
             if self.active_multimedia_key.is_some() {
